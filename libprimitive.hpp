@@ -1,0 +1,947 @@
+/* libprimitive - Primitive drawing wrapper for C++
+ * Copyright (c) 2021-2026 Jacob Nilsson
+ * Licensed under the MIT license
+ *
+ * Dependencies: Cairo, Pango
+ * - Xlib: Opt-in, #define PRIMITIVE_X11
+ * C++ version: >=17
+ * File version: 0.1.0
+ * Link: g++ ... -lx11 -DPRIMITIVE_X11 -DPRIMITIVE_IMPL
+ */
+#pragma once
+
+#include <cairo/cairo.h>
+#include <pango/pango.h>
+#include <pango/pangocairo.h>
+#include <string>
+#include <stdexcept>
+#include <cmath>
+#include <algorithm>
+#include <sstream>
+#include <vector>
+#include <filesystem>
+#include <mutex>
+
+#define PRIMITIVE
+
+#ifndef PRIMITIVE_CANVAS
+#define PRIMITIVE_CANVAS 1
+#endif
+
+#if PRIMITIVE_X11
+#include <X11/Xlib.h>
+#include <cairo/cairo-xlib.h>
+#endif
+
+/**
+ * @brief Namespace for the primitive drawing library.
+ */
+namespace primitive {
+    class draw_manager;
+    class font_manager;
+    class image_manager;
+
+    /**
+     * @brief Class for managing fonts in the drawing context.
+     * @note Quite primitive, for internal use by the draw_manager class.
+     */
+    class font_manager {
+        unsigned int h{};
+        PangoLayout* layout{};
+        bool active{false};
+        std::recursive_mutex mtx{};
+    public:
+        explicit font_manager() = default;
+        /**
+         * @brief Initializes the font manager with a specified font.
+         * @param font The name of the font to be used. (e.g "Sans 12")
+         */
+        void init_font(const std::string& font);
+        /**
+         * @brief Estimates the length of a given text string.
+         * @pre The font manager must be initialized with a font.
+         * @param text The text string to estimate the length of.
+         * @param length The length of the text string. If -1, the length is calculated automatically.
+         * @param markup If true, markup is applied to the text.
+         * @return A pair of integers representing the estimated width and height of the text.
+         */
+        [[nodiscard]] std::pair<int,int> estimate_length(const std::string& text, int length = -1, bool markup = true);
+        /**
+         * @brief Gets the internal PangoLayout object as a reference.
+         * @pre The font manager must be initialized with a font.
+         * @return A reference to the PangoLayout object.
+         */
+        [[nodiscard]] PangoLayout& get_layout() const;
+        /**
+         * @brief Initializes the font manager with a specified font.
+         * @param font The name of the font to be used. (e.g "Sans 12")
+         */
+        explicit font_manager(const std::string& font);
+        /**
+         * @brief Checks if the font manager is active.
+         * @return True if the font manager is active, false otherwise.
+         */
+        [[nodiscard]] bool is_active() const;
+        /**
+        * @brief Gets the height of the font.
+        * @return The height of the font.
+        */
+        [[nodiscard]] unsigned int get_height() const;
+        ~font_manager();
+
+        friend class draw_manager;
+    };
+
+    /**
+     * @brief Enumeration for different drawing protocols.
+     * @note X11 will use Xlib and Cairo for drawing.
+     * @note Canvas will use Cairo directly with an image buffer (void*).
+     */
+    enum class protocol : int {
+        x11 = 0,
+        canvas = 1,
+        unknown = -1
+    };
+
+#if PRIMITIVE_X11
+    /**
+     * @brief Structure for managing X11 window properties.
+     * @note This structure is used for X11 drawing.
+     */
+    struct x11_window {
+        Display* dpy{};
+        int screen{};
+        Window root{};
+        Visual* visual{};
+        unsigned int depth{};
+        Colormap cmap{};
+        Drawable drawable{};
+        GC gc{};
+    };
+#endif
+
+#if PRIMITIVE_CANVAS
+    /**
+     * @brief Structure for managing canvas window properties.
+     * @note This structure is used for canvas drawing.
+     */
+    struct canvas_window {
+        void* data{};
+    };
+#endif
+    /**
+     * @brief Structure for managing image properties.
+     * @note This structure is used for image drawing.
+     */
+    class image_manager {
+        uint8_t* data{};
+        cairo_surface_t* img_surface{};
+        cairo_t* img_context{};
+        bool initialized{false};
+        std::recursive_mutex mtx{};
+    public:
+        image_manager() = default;
+        /**
+         * @brief Initializes the image manager with image data.
+         * @param data Pointer to the image data.
+         * @param w Width of the image.
+         * @param h Height of the image.
+         */
+        image_manager(uint8_t* data, int w, int h);
+        /**
+         * @brief Initializes the image manager with image data.
+         * @param data Pointer to the image data.
+         * @param w Width of the image.
+         * @param h Height of the image.
+         */
+        void initialize(uint8_t* data, int w, int h);
+        /**
+         * @brief Get the raw cairo_surface_t* object.
+         * @return Pointer to the cairo_surface_t object.
+         * @note Do not under any circumstances free or destroy this object.
+         */
+        [[nodiscard]] cairo_surface_t* get_surface() const;
+        /**
+         * @brief Get the raw cairo_t* object.
+         * @return Pointer to the cairo_t object.
+         * @note Do not under any circumstances free or destroy this object.
+         */
+        [[nodiscard]] cairo_t* get_context() const;
+        ~image_manager();
+
+        friend draw_manager;
+    };
+    /**
+     * @brief Structure for managing drawing properties.
+     * @note This structure is used for setting colors and styles.
+     */
+    struct draw_properties {
+        std::string foreground{};
+        std::string background{};
+        int foreground_alpha{255};
+        int background_alpha{255};
+        bool invert{false};
+        bool filled{true};
+    };
+    /**
+     * @brief Structure for managing drawing shapes.
+     * @note This structure is used for setting shapes and styles.
+     */
+    struct draw_shape_properties {
+        std::string prev{};
+        std::string next{};
+        int prev_alpha{255};
+        int next_alpha{255};
+    };
+    /**
+     * @brief Structure for managing drawing positions.
+     * @note This structure is used for setting positions and sizes.
+     */
+    struct draw_position {
+        int x{};
+        int y{};
+        int w{};
+        int h{};
+    };
+    /**
+     * @brief Structure for managing drawing coordinates.
+     * @note This structure is used for setting coordinates.
+     */
+    struct draw_coords {
+        int x{};
+        int y{};
+    };
+    /**
+     * @brief Structure for managing drawing sizes.
+     * @note This structure is used for setting sizes.
+     */
+    struct draw_size {
+        int w{};
+        int h{};
+    };
+    /**
+     * @brief Class for managing drawing operations.
+     * @note This class is used for drawing shapes, images, and text.
+     */
+    class draw_manager {
+        int w{}, h{};
+        protocol proto{protocol::unknown};
+#if PRIMITIVE_X11
+        x11_window xwin{};
+#endif
+#if PRIMITIVE_CANVAS
+        canvas_window canvas_win{};
+#endif
+        font_manager font{};
+        cairo_surface_t* surface{};
+        cairo_t* d{};
+        std::recursive_mutex mtx{};
+
+        static void cairo_set_source_hex(cairo_t* cr, const std::string& col, int alpha);
+        void reinit();
+    public:
+        explicit draw_manager() = default;
+#if PRIMITIVE_CANVAS
+        /**
+         * @brief Initializes the draw manager with a canvas.
+         * @param data Pointer to the canvas data.
+         * @param w Width of the canvas.
+         * @param h Height of the canvas.
+         */
+        void initialize(void* data, int w, int h);
+#endif
+#if PRIMITIVE_X11
+        /**
+         * @brief Initializes the draw manager with X11.
+         * @param dpy Pointer to the X11 display.
+         * @param screen Screen number.
+         * @param root Root window.
+         * @param w Width of the drawable.
+         * @param h Height of the drawable.
+         * @param visual Pointer to the visual.
+         * @param depth Depth of the drawable.
+         * @param cmap Colormap.
+         */
+        void initialize_x11(Display* dpy, int screen, Window root, unsigned int w, unsigned int h, Visual *visual, unsigned int depth, Colormap cmap);
+        /**
+         * @brief Initializes the draw manager with X11.
+         * @param dpy Pointer to the X11 display.
+         * @param screen Screen number.
+         * @param root Root window.
+         * @param w Width of the drawable.
+         * @param h Height of the drawable.
+         * @param visual Pointer to the visual.
+         * @param depth Depth of the drawable.
+         * @param cmap Colormap.
+         */
+        draw_manager(Display* dpy, int screen, Window root, unsigned int w, unsigned int h, Visual *visual, unsigned int depth, Colormap cmap);
+#endif
+#if PRIMITIVE_CANVAS
+        /**
+         * @brief Initializes the draw manager with a canvas.
+         * @param data Pointer to the canvas data.
+         * @param w Width of the canvas.
+         * @param h Height of the canvas.
+         */
+        draw_manager(void* data, int w, int h);
+#endif
+        /**
+         * @brief Resizes the drawing area.
+         * @param size The new size of the drawing area.
+         */
+        void resize(const draw_size& size);
+        /**
+         * @brief Draws an image on the canvas.
+         * @param data Pointer to the image data.
+         * @param coords The coordinates where the image will be drawn.
+         */
+        void draw_image(void* data, const draw_position& coords);
+        /**
+         * @brief Draws an arrow shape on the canvas.
+         * @param pos The position and size of the arrow.
+         * @param direction The direction of the arrow (0 or 1).
+         * @param slash The slash direction (0 or 1).
+         * @param props The properties of the arrow shape.
+         */
+        void draw_arrow(const draw_position& pos, int direction, int slash, const draw_shape_properties& props);
+        /**
+         * @brief Draws a circle shape on the canvas.
+         * @param pos The position and size of the circle.
+         * @param direction The direction of the circle (0 or 1).
+         * @param props The properties of the circle shape.
+         */
+        void draw_circle(const draw_position& pos, int direction, const draw_shape_properties& props);
+        /**
+         * @brief Draws a rectangle shape on the canvas.
+         * @param pos The position and size of the rectangle.
+         * @param props The properties of the rectangle shape.
+         */
+        void draw_rect(const draw_position& pos, const draw_properties& props);
+#if PRIMITIVE_X11
+        /*
+         * @brief Map the drawable to a window.
+         * @param win The window to map the drawable to.
+         * @note This function only needs to be called for X11 protocol. Do it when the window has been created and preferably when you're done drawing.
+         */
+        void map(Window win);
+#endif
+        /**
+         * @brief Maps the drawable to the screen.
+         * @note Does not need to be called, but exists anyway.
+         */
+        void map();
+        /**
+         * @brief Saves the current screen to a file.
+         * @param file The filename to save the screen to.
+         */
+        void save_screen(const std::string& file);
+        /**
+         * @brief Initializes the font manager with a specified font.
+         * @param font The name of the font to be used. (e.g "Sans 12")
+         * @note Call before using methods such as draw_text.
+         */
+        void initialize_font(const std::string& font);
+        /**
+         * @brief Draws text on the canvas.
+         * @param pos The position and size of the text.
+         * @param padding The padding around the text.
+         * @param input_text The text to be drawn.
+         * @param markup If true, markup is applied to the text.
+         * @param props The properties of the text.
+         * @return The width of the drawn text.
+         */
+        int draw_text(const draw_position& pos, int padding, const std::string& input_text, bool markup, const draw_properties& props);
+        /**
+         * @brief Gets the width of the text.
+         * @param str The text string to measure.
+         * @param markup If true, markup is applied to the text.
+         * @note This function is pretty accurate, because it calls draw_text but does not draw anything. Therefore, it's not very fast and should not be used in a loop.
+         * @note Initialize the font manager before using this function.
+         */
+        unsigned int get_text_width(const std::string& str, bool markup = false);
+        /**
+         * @brief Gets the width of the text, clamped to a maximum value.
+         * @param str The text string to measure.
+         * @param n The maximum width of the text.
+         * @param markup If true, markup is applied to the text.
+         * @note This function is pretty accurate, because it calls draw_text but does not draw anything. Therefore, it's not very fast and should not be used in a loop.
+         * @note Initialize the font manager before using this function.
+         */
+        unsigned int get_text_width_clamp(const std::string& str, int n, bool markup = false);
+        /**
+         * @brief Gets the font manager as a reference.
+         * @return A reference to the font manager.
+         */
+        [[nodiscard]] font_manager& get_font_manager();
+        ~draw_manager();
+    };
+} // namespace primitive
+
+#ifdef PRIMITIVE_IMPL
+inline void primitive::font_manager::init_font(const std::string& font) {
+    std::lock_guard<std::recursive_mutex> lock(this->mtx);
+
+    if (this->active) {
+        throw std::runtime_error("FontManager already initialized");
+    }
+
+    active = true;
+
+    PangoFontMap* fontmap{};
+    PangoContext* context{};
+    PangoFontDescription* desc{};
+    PangoFontMetrics* metrics{};
+
+    if (font.empty()) {
+        throw std::invalid_argument("Font name cannot be empty");
+    }
+
+    fontmap = pango_cairo_font_map_new();
+    context = pango_font_map_create_context(fontmap);
+    desc = pango_font_description_from_string(font.c_str());
+
+    this->layout = pango_layout_new(context);
+
+    if (!this->layout) {
+        throw std::runtime_error{"Failed to load fonts."};
+    }
+
+    pango_layout_set_font_description(this->layout, desc);
+
+    metrics = pango_context_get_metrics(context, desc, pango_language_from_string ("en-us"));
+    this->h = pango_font_metrics_get_height(metrics) / PANGO_SCALE;
+
+    pango_font_metrics_unref(metrics);
+    g_object_unref(context);
+}
+[[nodiscard]] inline std::pair<int,int> primitive::font_manager::estimate_length(const std::string& text, const int length, bool markup) {
+    std::lock_guard<std::recursive_mutex> lock(this->mtx);
+
+    if (!this->layout) {
+        throw std::runtime_error("FontManager not initialized");
+    }
+    if (text.empty()) {
+        return {0, 0};
+    }
+
+    if (text.find('<') != std::string::npos && text.find('>') != std::string::npos) {
+        markup = true;
+    }
+
+    PangoRectangle r;
+
+    if (markup) {
+        pango_layout_set_markup(this->layout, text.c_str(), static_cast<int>(length == -1 ? text.length() : length));
+    } else {
+        pango_layout_set_text(this->layout, text.c_str(), static_cast<int>(length == -1 ? text.length() : length));
+    }
+
+    pango_layout_get_extents(this->layout, nullptr, &r);
+
+    if (markup) {
+        pango_layout_set_attributes(this->layout, nullptr);
+    }
+
+    return {
+        (r.width / PANGO_SCALE),
+        this->h
+    };
+}
+[[nodiscard]] inline PangoLayout& primitive::font_manager::get_layout() const {
+    if (!this->layout) {
+        throw std::runtime_error("FontManager not initialized");
+    }
+    return *this->layout;
+}
+inline primitive::font_manager::font_manager(const std::string& font) {
+    init_font(font);
+}
+[[nodiscard]] inline bool primitive::font_manager::is_active() const {
+    return this->active;
+}
+[[nodiscard]] inline unsigned int primitive::font_manager::get_height() const {
+    if (!this->layout) {
+        throw std::runtime_error("FontManager not initialized");
+    }
+    return this->h;
+}
+inline primitive::font_manager::~font_manager() {
+    if (this->layout) {
+        g_object_unref(this->layout);
+    }
+}
+
+inline void primitive::image_manager::initialize(uint8_t* data, int w, int h) {
+    std::lock_guard<std::recursive_mutex> lock(this->mtx);
+
+    if (!data || !w || !h) {
+        throw std::invalid_argument("Invalid arguments to ImageManager constructor");
+    }
+    if (this->initialized) {
+        throw std::runtime_error("ImageManager already initialized");
+    }
+
+    for (int i = 0; i < w * h; i++) {
+        uint8_t* px = &data[i*4];
+        const uint8_t r = px[0];
+        const uint8_t g = px[1];
+        const uint8_t b = px[2];
+        const uint8_t a = px[3];
+
+        px[0] = (r * a) / 255;
+        px[1] = (g * a) / 255;
+        px[2] = (b * a) / 255;
+        px[3] = a;
+    }
+
+    this->initialized = true;
+
+    img_surface = cairo_image_surface_create_for_data(data, CAIRO_FORMAT_ARGB32, w, h, 4 * w);
+    if (!img_surface || cairo_surface_status(img_surface) != CAIRO_STATUS_SUCCESS) {
+        this->initialized = false;
+        throw std::runtime_error("Failed to create image surface");
+    }
+    img_context = cairo_create(img_surface);
+    if (!img_context || cairo_status(img_context) != CAIRO_STATUS_SUCCESS) {
+        this->initialized = false;
+        throw std::runtime_error("Failed to create image context");
+    }
+}
+
+inline primitive::image_manager::image_manager(uint8_t* data, int w, int h) : data(data) {
+    this->initialize(data, w, h);
+}
+
+inline cairo_surface_t* primitive::image_manager::get_surface() const {
+    if (!this->initialized) {
+        throw std::runtime_error("ImageManager not initialized");
+    }
+
+    return this->img_surface;
+}
+
+inline cairo_t* primitive::image_manager::get_context() const {
+    if (!this->initialized) {
+        throw std::runtime_error("ImageManager not initialized");
+    }
+
+    return this->img_context;
+}
+
+inline primitive::image_manager::~image_manager() {
+    if (!initialized) {
+        return;
+    }
+
+    if (img_surface && cairo_surface_get_reference_count(img_surface) != 0) {
+        cairo_surface_destroy(img_surface);
+    }
+
+    if (img_context && cairo_get_reference_count(img_context) != 0) {
+        cairo_destroy(img_context);
+    }
+
+    initialized = false;
+}
+
+inline void primitive::draw_manager::cairo_set_source_hex(cairo_t* cr, const std::string& col, int alpha) {
+    if (col.empty() || col[0] != '#' || col.length() != 7) {
+        throw std::invalid_argument("Invalid color format. Expected format: #RRGGBB");
+    }
+
+    unsigned int hex;
+    std::istringstream iss(col.substr(1));
+    iss >> std::hex >> hex;
+
+    if (iss.fail()) {
+        throw std::invalid_argument("Failed to parse color hex value");
+    }
+
+    double r = ((hex >> 16) & 0xFF) / 255.0;
+    double g = ((hex >> 8) & 0xFF) / 255.0;
+    double b = (hex & 0xFF) / 255.0;
+
+    cairo_set_source_rgba(cr, r, g, b, alpha / 255.0);
+}
+
+#if PRIMITIVE_CANVAS
+inline void primitive::draw_manager::initialize(void* data, int w, int h) {
+    std::lock_guard<std::recursive_mutex> lock(this->mtx);
+
+    if (!data || !w || !h) {
+        throw std::invalid_argument("Invalid arguments to DrawManager constructor");
+    }
+
+    this->proto = protocol::canvas;
+    this->canvas_win.data = data;
+    this->w = w;
+    this->h = h;
+
+    this->reinit();
+}
+#endif
+#if PRIMITIVE_X11
+inline void primitive::draw_manager::initialize_x11(Display* dpy, int screen, Window root, unsigned int w, unsigned int h, Visual *visual, unsigned int depth, Colormap cmap) {
+    std::lock_guard<std::recursive_mutex> lock(this->mtx);
+
+    if (!dpy || !root || !visual || !depth) {
+        throw std::invalid_argument("Invalid arguments to DrawManager constructor");
+    }
+
+    this->proto = protocol::x11;
+    this->xwin.dpy = dpy;
+    this->xwin.screen = screen;
+    this->xwin.root = root;
+    this->w = static_cast<int>(w);
+    this->h = static_cast<int>(h);
+    this->xwin.visual = visual;
+    this->xwin.depth = depth;
+    this->xwin.cmap = cmap;
+
+    this->xwin.drawable = XCreatePixmap(dpy, root, w, h, depth);
+
+    if (!this->xwin.drawable) {
+        throw std::runtime_error("Failed to create pixmap");
+    }
+
+    this->xwin.gc = XCreateGC(dpy, this->xwin.drawable, 0, nullptr);
+
+    if (!this->xwin.gc) {
+        XFreePixmap(dpy, this->xwin.drawable);
+        throw std::runtime_error("Failed to create graphics context");
+    }
+
+    XSetLineAttributes(dpy, this->xwin.gc, 1, LineSolid, CapButt, JoinMiter);
+
+    this->reinit();
+}
+inline primitive::draw_manager::draw_manager(Display* dpy, int screen, Window root, unsigned int w, unsigned int h, Visual *visual, unsigned int depth, Colormap cmap) {
+    initialize_x11(dpy, screen, root, w, h, visual, depth, cmap);
+}
+#endif
+#if PRIMITIVE_CANVAS
+inline primitive::draw_manager::draw_manager(void* data, int w, int h) {
+    initialize(data, w, h);
+}
+#endif
+inline void primitive::draw_manager::resize(const draw_size& size) {
+    std::lock_guard<std::recursive_mutex> lock(this->mtx);
+
+    this->w = size.w;
+    this->h = size.h;
+#if PRIMITIVE_X11
+    if (this->proto == protocol::x11) {
+        if (!this->xwin.drawable) {
+            throw std::runtime_error("Drawable not initialized");
+        }
+
+        XFreePixmap(this->xwin.dpy, this->xwin.drawable);
+
+        this->xwin.drawable = XCreatePixmap(this->xwin.dpy, this->xwin.root, size.w, size.h, this->xwin.depth);
+        if (!this->xwin.drawable) {
+            throw std::runtime_error("Failed to create new pixmap");
+        }
+    }
+#endif
+}
+inline void primitive::draw_manager::draw_image(void* data, const draw_position& coords) {
+    std::lock_guard<std::recursive_mutex> lock(this->mtx);
+
+    if (data == nullptr) {
+        throw std::invalid_argument("Image data cannot be null");
+    }
+
+    this->reinit();
+
+    auto manager = image_manager();
+    manager.initialize(static_cast<uint8_t*>(data), coords.w, coords.h);
+
+    cairo_set_operator(this->d, CAIRO_OPERATOR_OVER);
+
+    cairo_set_source_surface(this->d, manager.get_surface(), coords.x, coords.y);
+    cairo_mask_surface(this->d, manager.get_surface(), coords.x, coords.y);
+
+    cairo_set_source_surface(this->d, this->surface, this->w, this->h);
+}
+
+inline void primitive::draw_manager::draw_arrow(const draw_position& pos, int direction, int slash, const draw_shape_properties& props) {
+    std::lock_guard<std::recursive_mutex> lock(this->mtx);
+
+    int x = pos.x;
+    int y = pos.y;
+    int w = pos.w;
+    int h = pos.h;
+
+    x = direction ? x : x + w;
+    w = direction ? w : - w;
+
+    this->reinit();
+
+    double hh = slash ? (direction ? 0 : h) : h / 2;
+
+    cairo_set_source_hex(this->d, props.prev, props.prev_alpha);
+    cairo_set_operator(this->d, CAIRO_OPERATOR_SOURCE);
+
+    cairo_rectangle(this->d, x, y, w, h);
+    cairo_fill(this->d);
+
+    cairo_move_to(this->d, x, y);
+    cairo_line_to(this->d, x + w, y + hh);
+    cairo_line_to(this->d, x, y + h);
+    cairo_close_path(this->d);
+
+    cairo_set_source_hex(this->d, props.next, props.next_alpha);
+    cairo_fill(this->d);
+}
+
+inline void primitive::draw_manager::draw_circle(const draw_position& pos, int direction, const draw_shape_properties& props) {
+    std::lock_guard<std::recursive_mutex> lock(this->mtx);
+
+    this->reinit();
+
+    cairo_set_source_hex(this->d, props.prev, props.prev_alpha);
+    cairo_set_operator(this->d, CAIRO_OPERATOR_SOURCE);
+
+    cairo_rectangle(this->d, pos.x, pos.y, pos.w, pos.h);
+    cairo_fill(this->d);
+
+    double cx = direction ? pos.x + pos.w - pos.h / 2.0 : pos.x + pos.h / 2.0;
+    double cy = pos.y + pos.h / 2;
+    double rad = pos.h / 2.0;
+
+    double start = direction ? -M_PI_2 : M_PI_2;
+    double end = direction ? M_PI_2 : 3 * M_PI_2;
+
+    cairo_arc(this->d, cx, cy, rad, start, end);
+    cairo_close_path(this->d);
+
+    cairo_set_source_hex(this->d, props.next, props.next_alpha);
+    cairo_fill(this->d);
+}
+inline void primitive::draw_manager::draw_rect(const draw_position& pos, const draw_properties& props) {
+    std::lock_guard<std::recursive_mutex> lock(this->mtx);
+
+    this->reinit();
+
+    cairo_set_source_hex(this->d, props.invert ? props.background.c_str() : props.foreground.c_str(), props.invert ? props.background_alpha : props.foreground_alpha);
+    cairo_set_operator(this->d, CAIRO_OPERATOR_SOURCE);
+
+    if (props.filled) {
+        cairo_rectangle(this->d, pos.x, pos.y, pos.w, pos.h);
+        cairo_fill(this->d);
+    } else {
+        cairo_rectangle(this->d, pos.x, pos.y, pos.w - 1, pos.h - 1);
+        cairo_stroke(this->d);
+    }
+}
+#if PRIMITIVE_X11
+inline void primitive::draw_manager::map(Window win) {
+    std::lock_guard<std::recursive_mutex> lock(this->mtx);
+
+    if (this->proto == protocol::x11) {
+        if (!this->xwin.drawable) {
+            throw std::runtime_error("Drawable not initialized");
+        }
+        XCopyArea(this->xwin.dpy, this->xwin.drawable, win, this->xwin.gc, 0, 0, this->w, this->h, 0, 0);
+        XFlush(this->xwin.dpy);
+    } else {
+        throw std::runtime_error("Mapping not supported for this protocol");
+    }
+}
+#endif
+inline void primitive::draw_manager::map() {
+    std::lock_guard<std::recursive_mutex> lock(this->mtx);
+
+    if (this->proto == protocol::x11) {
+        throw std::runtime_error("X11 must be called with a window");
+    }
+}
+inline void primitive::draw_manager::save_screen(const std::string& file) {
+    std::lock_guard<std::recursive_mutex> lock(this->mtx);
+
+    if (file.empty()) {
+        throw std::invalid_argument("Invalid filename");
+    }
+
+    if (!this->surface) {
+        throw std::runtime_error("No surface to save");
+    }
+
+    if (std::filesystem::is_directory(file)) {
+        throw std::invalid_argument("Filename is a directory");
+    }
+
+    std::string path = std::filesystem::path(file).parent_path().string();
+    if (!std::filesystem::exists(path)) {
+        std::filesystem::create_directories(path);
+
+        if (!std::filesystem::is_directory(path)) {
+            throw std::runtime_error("Failed to create directory");
+        }
+    }
+
+    if (cairo_surface_write_to_png(this->surface, file.c_str()) != CAIRO_STATUS_SUCCESS) {
+        throw std::runtime_error("Failed to save screen");
+    }
+}
+inline void primitive::draw_manager::initialize_font(const std::string& font) {
+    if (font.empty()) {
+        throw std::invalid_argument("Font name cannot be empty");
+    }
+
+    this->font.init_font(font);
+}
+inline void primitive::draw_manager::reinit() {
+    std::lock_guard<std::recursive_mutex> lock(this->mtx);
+
+    if (this->surface && cairo_surface_get_reference_count(this->surface) != 0) {
+        cairo_surface_destroy(this->surface);
+    }
+    if (this->d && cairo_get_reference_count(this->d) != 0) {
+        cairo_destroy(this->d);
+    }
+
+    if (this->proto == protocol::unknown) {
+        throw std::runtime_error("Unknown protocol");
+    }
+
+    if (this->proto == protocol::canvas) {
+#if PRIMITIVE_CANVAS
+        this->surface = cairo_image_surface_create_for_data(static_cast<unsigned char*>(this->canvas_win.data), CAIRO_FORMAT_ARGB32, this->w, this->h, this->w * 4);
+#endif
+    } else {
+#if PRIMITIVE_X11
+        this->surface = cairo_xlib_surface_create(this->xwin.dpy, this->xwin.drawable, this->xwin.visual, this->w, this->h);
+#endif
+    }
+
+    this->d = cairo_create(this->surface);
+    if (!this->d) {
+        throw std::runtime_error("Failed to create cairo context");
+    }
+}
+
+inline int primitive::draw_manager::draw_text(const draw_position& pos, int padding, const std::string& input_text, bool markup, const draw_properties& props) {
+    std::lock_guard<std::recursive_mutex> lock(this->mtx);
+
+    int x = pos.x;
+    int y = pos.y;
+    unsigned int w = pos.w;
+    unsigned int h = pos.h;
+
+    const int render = x || y || w || h;
+
+    if (!this->font.is_active()) {
+        throw std::runtime_error("FontManager not initialized");
+    }
+
+    if (!render) {
+        w = ~w;
+    } else {
+        x += padding;
+        w -= padding;
+
+        this->reinit();
+
+        cairo_set_source_hex(this->d, props.invert ? props.foreground.c_str() : props.background.c_str(), props.invert ? props.foreground_alpha : props.background_alpha);
+        cairo_set_operator(this->d, CAIRO_OPERATOR_SOURCE);
+        cairo_rectangle(this->d, x - padding, y, w + padding, h);
+        cairo_fill(this->d);
+    }
+
+    // HACK: guess that there is no markup if there is no presence of "</"
+    // not sure if it's really even necessary
+    if (input_text.find("</") == std::string::npos) {
+        markup = false;
+    }
+
+    if (input_text.empty()) {
+        return x + (render ? w : 0);
+    }
+
+    int length = static_cast<int>(input_text.length());
+    int estimated_width = font.estimate_length(input_text, input_text.length(), markup).first;
+
+    for (length = std::min(length, static_cast<int>(input_text.length())); length && estimated_width > w; font.estimate_length(input_text, length--, markup).first) {
+        estimated_width = font.estimate_length(input_text, length, markup).first;
+    }
+
+    if (!length) {
+        return x + (render ? w : 0);
+    }
+
+    std::string text = input_text.substr(0, length);
+    if (length < static_cast<int>(input_text.length())) {
+        for (std::size_t i = length; i && i > length - 3; text[--i] = '.')
+            ; // NOP
+    }
+
+    estimated_width = font.estimate_length(text, -1, markup).first;
+
+    // HACK: guess that there is no markup if there is no presence of "</"
+    // not sure if it's really even necessary
+    if (text.find("</") == std::string::npos) {
+        markup = false;
+    }
+
+    if (!render) {
+        return x + estimated_width;
+    }
+
+    if (markup) {
+        pango_layout_set_markup(this->font.layout, text.c_str(), length);
+    } else {
+        pango_layout_set_text(this->font.layout, text.c_str(), length);
+    }
+
+    pango_layout_set_single_paragraph_mode(this->font.layout, true);
+
+    cairo_set_source_hex(this->d, props.foreground, props.foreground_alpha);
+    cairo_move_to(this->d, x, y + (h - this->font.get_height()) / 2);
+
+    pango_cairo_update_layout(this->d, this->font.layout);
+    pango_cairo_show_layout(this->d, this->font.layout);
+
+    cairo_set_operator(this->d, CAIRO_OPERATOR_SOURCE);
+
+    if (markup) {
+        pango_layout_set_attributes(this->font.layout, nullptr);
+    }
+
+    return (x + estimated_width) + (w - estimated_width);
+}
+inline unsigned int primitive::draw_manager::get_text_width(const std::string& str, bool markup) {
+    try {
+        return draw_text({0, 0, 0, 0}, 0, str, markup, {"#000000", "#000000", 0, 0});
+    } catch (const std::exception&) {
+        return 0;
+    }
+}
+inline unsigned int primitive::draw_manager::get_text_width_clamp(const std::string& str, int n, bool markup) {
+    try {
+        return std::min(n, draw_text({0, 0, 0, 0}, 0, str, markup, {"#000000", "#000000", 0, 0}));
+    } catch (const std::exception&) {
+        return n;
+    }
+}
+inline primitive::font_manager& primitive::draw_manager::get_font_manager() {
+    return this->font;
+}
+inline primitive::draw_manager::~draw_manager() {
+#if PRIMITIVE_X11
+    if (this->proto == protocol::x11 && this->xwin.dpy && this->xwin.drawable) {
+        XFreePixmap(this->xwin.dpy, this->xwin.drawable);
+    }
+    if (this->proto == protocol::x11 && this->xwin.dpy && this->xwin.gc) {
+        XFreeGC(this->xwin.dpy, this->xwin.gc);
+    }
+#endif
+
+    if (this->surface && cairo_surface_get_reference_count(this->surface) != 0) {
+        cairo_surface_destroy(this->surface);
+    }
+    if (this->d && cairo_get_reference_count(this->d) != 0) {
+        cairo_destroy(this->d);
+    }
+}
+#endif // PRIMITIVE_IMPL
